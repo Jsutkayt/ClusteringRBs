@@ -1,0 +1,382 @@
+---
+title: "Clustering RB's"
+author: "Jackson Sutkaytis"
+date: "2024-11-18"
+output: 
+  distill::distill_article:
+    self_contained: true
+    highlight: kate
+    toc: true
+---
+
+```{r setup, include=FALSE}
+# Set options for knitr
+knitr::opts_chunk$set(echo = TRUE)
+
+# Loading necessary libraries for data manipulation, visualization, and analysis
+library(rmarkdown)
+library(ggplot2)
+library(nflreadr)
+library(tidyverse)
+library(gsisdecoder)
+library(rvest)
+library(janitor)
+library(gghighlight)
+library(ggrepel)
+library(extrafont)
+library(gt)
+library(ggimage)
+library(distill)
+library(corrplot)
+library(gridExtra)
+library(factoextra)
+library(ggrepel)
+library(dplyr)
+```
+
+**Load Rosters, Snap Counts, and Player Stats Data for 2024 Season**
+```{r}
+#Set Seed
+set.seed(2024)
+
+#Each player and their team rosters
+rosters <- nflreadr::load_rosters(seasons = 2024)
+
+#Snap counts for each week aggregated for the entire season
+seasonSnaps <- nflreadr::load_snap_counts(seasons = 2024)
+seasonSnaps <- seasonSnaps[seasonSnaps$position == "RB", ]
+seasonSnaps <- seasonSnaps %>% 
+  group_by(pfr_player_id, player) %>% 
+  summarise(summedSnaps = sum(offense_snaps))
+
+#RB stats like speed and weight
+playerStats <- nflreadr::load_combine() %>% filter(pos == "RB")
+
+#All active 32 NFL teams
+teams <- nflreadr::load_teams(current = TRUE)
+```
+
+**Let's Investigate a Threshold**
+
+```{r warning=FALSE}
+#Plotting Snaps by each RB
+ggplot(seasonSnaps, aes(x = summedSnaps, y = reorder(player, summedSnaps))) +
+  geom_bar(stat = "identity", fill = "orange") +
+  labs(
+    x = "Player",
+    y = "Summed Snaps",
+    title = "Summed Snaps by Player"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),  
+    plot.title = element_text(size = 14)
+  )
+#It does not seem like there is a clear fall off, let us just go with the top ~60% eye test. 
+
+
+#Lets go with 200
+JOINTABLE <- seasonSnaps %>% 
+  filter(summedSnaps > 200) %>% 
+  select(pfr_player_id, player)
+
+
+```
+
+**Let's figure out what Attributes a RB has that Would be Good for Grouping**
+
+<ol>
+
+1.  40 time
+
+2.  Height
+
+3.  Weight
+
+4.  Yards Per Carry (YPC)
+
+5.  Broken Tackles
+
+6.  Outside or Inside Run Percentage
+
+7.  Avg of YDs after contact
+
+    </ol>
+
+**Now we Will get Some Metrics from Season Data**
+
+```{r warning=FALSE}
+
+#Play Data
+DFStats <- load_pbp(seasons = 2024) 
+
+#Wrangle Our Variables to see Run Location
+DFStats <- DFStats %>% 
+  filter(season_type == "REG" & play_type == "run") %>% 
+  select(rusher_player_id, rusher_player_name, rushing_yards, run_location) %>% 
+  mutate(run_location = if_else(run_location == "right" | run_location == "left", "outside", run_location)) %>% 
+  drop_na()
+
+#Calculate the Metrics
+DFStats <- DFStats %>%
+  group_by(rusher_player_id, rusher_player_name) %>%
+  summarise(
+    YPC = mean(rushing_yards),
+    total_runs = n(),
+    middle_runs = sum(run_location == "middle"),
+    middle_run_percent = (middle_runs / total_runs) * 100
+  ) %>% 
+  select(rusher_player_id, rusher_player_name, YPC, middle_run_percent)
+
+```
+
+**Scraping More Data**
+
+```{r warning=FALSE}
+#Random NFL Stats Website
+url <- "https://www.fantasypros.com/nfl/advanced-stats-rb.php"
+onlineStats <- read_html(url)
+
+#Scrapped the Table
+onlineStats <- onlineStats %>% 
+  html_node("table") %>% 
+  html_table(fill = TRUE)
+
+#Promote Headers
+colnames(onlineStats) <- onlineStats[2, ] 
+onlineStats <- onlineStats[-c(1, 2), ] 
+colnames(onlineStats) <- make.names(colnames(onlineStats), unique = TRUE)
+
+#Touch up the Names and Convert to Keys
+onlineStats <- onlineStats %>%
+  mutate(Player = gsub("^(\\S+\\s+\\S+)\\s.*", "\\1", Player))
+
+```
+
+**Tie All of our Data Together**
+
+<ol>
+
+1.  DFCombine (pfr_player_id)
+2.  DFStats (rusher_player_id)
+3.  rosters (gsis_id & pfr_id)
+4.  Online Data (player)
+
+</ol>
+
+```{r warning=FALSE}
+
+#Joining Combine Stats
+JOINTABLE <- JOINTABLE %>%
+    left_join(rosters %>% select(pfr_id, gsis_id), by = c("pfr_player_id" = "pfr_id")) %>%
+    left_join(playerStats %>% select(pfr_id, forty, ht, wt), by = c("pfr_player_id" = "pfr_id")) %>%
+    rename(
+        gsis_id = gsis_id,
+        forty = forty,
+        ht = ht,
+        wt = wt
+    ) %>% 
+  drop_na()
+
+#Joining Season Stats
+JOINTABLE <- JOINTABLE %>% 
+  left_join(DFStats %>% select(rusher_player_id, YPC, middle_run_percent), by = c("gsis_id" = "rusher_player_id"))
+
+#Join our Scrapped Data
+JOINTABLE <- JOINTABLE %>%
+  left_join(
+    onlineStats %>% select(Player, BRKTKL, YACON.ATT), 
+    by = c("player" = "Player")
+  ) %>% 
+  drop_na()
+#Rename
+DATA <- JOINTABLE 
+
+#Convert to Numbers
+DATA$BRKTKL <- as.numeric(DATA$BRKTKL)
+DATA$YACON.ATT <- as.numeric(DATA$YACON.ATT)
+
+
+##Convert Height to Numeric
+convertToInches <- function(height) {
+  parts <- as.numeric(unlist(strsplit(height, "-")))
+  return(parts[1] * 12 + parts[2])  
+}
+DATA$ht <- sapply(DATA$ht, convertToInches)
+
+```
+
+**How About a Little EDA with our Final Table?**
+```{r warning=FALSE}
+
+#Look into distributions
+DATA %>%
+  gather(Attributes, value, c(4:10)) %>% 
+  ggplot(aes(x = value, fill = Attributes)) +
+  geom_histogram(colour = "black", show.legend = FALSE, bins = 20) + 
+  facet_wrap(~Attributes, scales = "free_x") +
+  labs(x = "Values", y = "Frequency", title = "Attributes - Histograms") +
+  theme_bw()
+
+```
+
+```{r warning=FALSE}
+#Density
+DATA %>% 
+  gather(Attributes, value, c(4:10) ) %>%
+  ggplot(aes(x=value, fill=Attributes)) +
+  geom_density(colour="black", alpha=0.9, show.legend=FALSE) +
+  facet_wrap(~Attributes, scales="free_x") +
+  labs(x="Values", y="Density",
+       title="Attributes - Density plots") +
+  theme_bw()
+```
+
+```{r warning=FALSE}
+#Subset Numeric Data
+numericDATA <- DATA[,c(4:10)]
+#Correlation Plot
+corrplot(cor(numericDATA, use = "complete.obs"), 
+         type = "upper", 
+         method = "color", 
+         tl.cex = 0.6, 
+         addCoef.col = "black") 
+```
+
+**Correlations**
+
+```{r warning=FALSE}
+#Plotting the Highest Correlation (I Assume Multicolinearity)
+ggplot(DATA, aes(x=YPC, y=YACON.ATT)) +
+  geom_point() +
+  geom_smooth(method="lm", se=FALSE) +
+  labs(title="YPC and YACON.ATT") +
+  theme_bw()
+```
+
+**Scale our data**
+
+```{r}
+#Scale and Center
+scaledDATA <- prcomp(DATA[, 4:10], center = TRUE, scale. = TRUE)
+#Join it Back
+DATA[4:10] <- scaledDATA$x
+
+```
+
+**Let the fun begin**
+
+```{r}
+#Within Cluster Summed Squares
+fviz_nbclust(DATA[, 4:10], kmeans, method = "wss") +
+    labs(subtitle = "Elbow Method for K-means Clustering")
+
+##Silhouette Method - Note our value is relatively close to 0, meaning we are having a lot of overlapping clusters. 
+fviz_nbclust(DATA[, 4:10], kmeans, method = "silhouette") +
+    labs(subtitle = "Silhouette Method for K-means Clustering")
+
+
+```
+
+**Code for 2 Cores**
+
+```{r}
+# Tune
+clusterTwo <- kmeans(DATA[, 4:10], centers = 2, nstart = 25)
+# Generate the plot
+  p2 <- fviz_cluster(clusterTwo, data = DATA[, 4:10],
+                    ellipse.type = "euclid", 
+                    star.plot = FALSE, 
+                    repel = TRUE, 
+                    labelsize = 1,
+                    ellipse = FALSE,
+                    ggtheme = theme_minimal() 
+  ) + 
+    labs(title = "K-Means 2 Clusters, Euclidian") + 
+    theme(plot.title = element_text(size = 10),
+          axis.text = element_text(size = 8),  
+          axis.title = element_text(size = 10)) 
+  
+print(p2)
+
+```
+
+**8 Cores**
+
+```{r}
+# Tune
+clusterEight <- kmeans(DATA[, 4:10], centers = 8, nstart = 25)
+# Generate the plot
+  p8 <- fviz_cluster(clusterEight, data = DATA[, 4:10],
+                    ellipse.type = "euclid", 
+                    star.plot = FALSE, 
+                    repel = TRUE, 
+                    labelsize = 1,
+                    ellipse = FALSE,
+                    ggtheme = theme_minimal() 
+  ) + 
+    labs(title = "K-Means 8 Clusters, Euclidian") + 
+    theme(plot.title = element_text(size = 10),
+          axis.text = element_text(size = 8),  
+          axis.title = element_text(size = 10)) 
+  
+print(p8)
+```
+
+**Hierarchical Clustering**
+
+```{r}
+#Create the distance matrix
+distanceMatrix <- dist(DATA[,4:10], method = "euclidean")
+
+# Perform hierarchical clustering
+hclust <- hclust(distanceMatrix, method = "complete")
+
+# Create the dendrogram
+dog <- plot(hclust, 
+     main = "Hierarchical Clustering Dendrogram", 
+     xlab = "Observations", 
+     ylab = "Height", 
+     col = "blue", 
+     cex = 0.6, 
+     hang = -1, 
+     labels = DATA$player) 
+
+rect.hclust(hclust, k = 8, border = 2:5)
+
+
+```
+
+
+**The Grand Plot**
+```{r}
+
+#Join Team to Use as a Key
+DATA <- DATA %>% 
+  left_join(rosters %>%  select(full_name, last_name, team), join_by("player" == "full_name")) 
+#Join the Logo URL
+DATA <- DATA %>% 
+  left_join(teams %>%  select( team_abbr, team_logo_espn), join_by("team" == "team_abbr"))
+#Cut our Tree
+clusterLabs <- cutree(hclust, k = 8)
+#Add our clusters to the DF
+DATA$Cluster <- factor(clusterLabs)
+
+#Add Our Principle Component Analysis
+DATA$PCA1 <- scaledDATA$x[,1]
+DATA$PCA2 <- scaledDATA$x[,2]
+#Aggregate our PCAs
+cluster_centers <- aggregate(cbind(PCA1, PCA2) ~ Cluster, data = DATA, mean)
+
+#Plot PCAs and Clusters
+ggplot(DATA, aes(x = PCA1, y = PCA2)) +
+  geom_image(aes(image = team_logo_espn), size = 0.05) +  # Add team logos as points
+  geom_text_repel(aes(label = player, color = Cluster), size = 2.5, max.overlaps = 10) +  # Color labels by cluster
+  scale_color_manual(values = rainbow(length(unique(DATA$Cluster)))) +  # Distinct colors for clusters
+  labs(x = "PCA1 (Most Significant Pattern)", y = "PCA2 (2nd Significant Pattern)", color = "Cluster", title = "Clusters with Team Logos and Player Labels") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+
+```
